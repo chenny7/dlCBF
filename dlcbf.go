@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"hash/fnv"
+	"io"
 	"math"
 	"sync"
 )
@@ -107,10 +108,13 @@ func (dlcbf *Dlcbf) getTargets(datas [][]byte) []target {
 Add data to filter return true if insertion was successful,
 returns false if data already in filter or size limit was exceeeded
 */
-func (dlcbf *Dlcbf) addTarget(t target) bool {
+func (dlcbf *Dlcbf) addTarget(t target, permit_duplicate bool) bool {
 	m := dlcbf.lookup(t)
 	if m != nil {
 		// key already exist
+		if !permit_duplicate {
+			return false
+		}
 		bucket := &dlcbf.tables[m.tbl][m.bkt]
 		if bucket.counters[m.entry] >= math.MaxUint8 {
 			// the counter exceed the limit
@@ -148,7 +152,16 @@ func (dlcbf *Dlcbf) Add(data []byte) bool {
 	dlcbf.lock.Lock()
 	defer dlcbf.lock.Unlock()
 
-	return dlcbf.addTarget(t)
+	return dlcbf.addTarget(t, true)
+}
+
+func (dlcbf *Dlcbf) TestAndAdd(data []byte) bool {
+	t := dlcbf.getTarget(data)
+
+	dlcbf.lock.Lock()
+	defer dlcbf.lock.Unlock()
+
+	return dlcbf.addTarget(t, false)
 }
 
 func (dlcbf *Dlcbf) AddBatch(datas [][]byte) []bool {
@@ -159,7 +172,20 @@ func (dlcbf *Dlcbf) AddBatch(datas [][]byte) []bool {
 	defer dlcbf.lock.Unlock()
 
 	for k := range targets {
-		res[k] = dlcbf.addTarget(targets[k])
+		res[k] = dlcbf.addTarget(targets[k], true)
+	}
+	return res
+}
+
+func (dlcbf *Dlcbf) TestAddBatch(datas [][]byte) []bool {
+	targets := dlcbf.getTargets(datas)
+	res := make([]bool, len(datas))
+
+	dlcbf.lock.Lock()
+	defer dlcbf.lock.Unlock()
+
+	for k := range targets {
+		res[k] = dlcbf.addTarget(targets[k], false)
 	}
 	return res
 }
@@ -281,4 +307,91 @@ func (dlcbf *Dlcbf) Count() uint {
 		}
 	}
 	return count
+}
+
+func (dlcbf *Dlcbf) ClearAll() {
+	dlcbf.lock.Lock()
+	defer dlcbf.lock.Unlock()
+
+	for i := range dlcbf.tables {
+		for j := range dlcbf.tables[i] {
+			for k := 0; k < int(dlcbf.tables[i][j].count); k++ {
+				dlcbf.tables[i][j].entries[k] = 0
+				dlcbf.tables[i][j].counters[k] = 0
+			}
+			dlcbf.tables[i][j].count = 0
+		}
+	}
+}
+
+func (dlcbf *Dlcbf) Encode() ([]byte, error) {
+	// dlcbf.lock.Lock()
+	// defer dlcbf.lock.Unlock()
+	bytes := make([]byte, 0, int(dlcbf.numTables)*bucketsSize*(bucketHeight*3))
+
+	for i := range dlcbf.tables { // tables
+		for j := range dlcbf.tables[i] { // buckets
+			for k := 0; k < bucketHeight; k++ {
+				next := make([]byte, 2)
+				binary.LittleEndian.PutUint16(next, uint16(dlcbf.tables[i][j].entries[k]))
+				bytes = append(bytes, next...)
+				bytes = append(bytes, dlcbf.tables[i][j].counters[k])
+			}
+		}
+	}
+
+	return bytes, nil
+}
+
+func (dlcbf *Dlcbf) Decode(bytes []byte) error {
+
+	for i := range dlcbf.tables { // tables
+		for j := range dlcbf.tables[i] { // buckets
+			for k := 0; k < bucketHeight; k++ {
+				var next []byte
+				next, bytes = bytes[0:3], bytes[3:]
+
+				if fp := binary.LittleEndian.Uint16(next[0:2]); fp != 0 {
+					dlcbf.tables[i][j].entries[k] = fingerprint(fp)
+					dlcbf.tables[i][j].counters[k] = bytes[2]
+					dlcbf.tables[i][j].count++
+				}
+			}
+		}
+	}
+
+	return nil
+}
+
+func (dlcbf *Dlcbf) WriteTo(stream io.Writer) (int64, error) {
+	data, _ := dlcbf.Encode()
+	length := uint64(len(data))
+	err := binary.Write(stream, binary.LittleEndian, length)
+	if err != nil {
+		return 0, err
+	}
+
+	err = binary.Write(stream, binary.LittleEndian, data)
+	if err != nil {
+		return 0, err
+	}
+
+	return int64(length) + int64(binary.Size(uint64(0))), nil
+}
+
+func (dlcbf *Dlcbf) ReadFrom(stream io.Reader) (int64, error) {
+	var length uint64
+	err := binary.Read(stream, binary.LittleEndian, &length)
+	if err != nil {
+		return 0, err
+	}
+
+	data := make([]byte, length)
+	err = binary.Read(stream, binary.LittleEndian, &data)
+	if err != nil {
+		return 0, err
+	}
+
+	dlcbf.Decode(data)
+	return int64(length) + int64(binary.Size(uint64(0))), nil
 }
