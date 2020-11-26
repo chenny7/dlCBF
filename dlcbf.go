@@ -5,20 +5,30 @@ import (
 	"errors"
 	"hash/fnv"
 	"math"
+	"sync"
 )
 
 const bucketHeight = 8
+const bucketsSize = 4096
 
 type fingerprint uint16
 
 type target struct {
-	bucketIndex uint
+	bucketIndex []uint
+	fingerprint fingerprint
+}
+
+type match struct {
+	tbl         uint
+	bkt         uint
+	entry       uint
 	fingerprint fingerprint
 }
 
 type bucket struct {
-	entries [bucketHeight]fingerprint
-	count   uint8
+	entries  [bucketHeight]fingerprint
+	counters [bucketHeight]uint8 // counter for each entry
+	count    uint8               // entries used
 }
 
 type table []bucket
@@ -30,6 +40,7 @@ type Dlcbf struct {
 	tables     []table
 	numTables  uint
 	numBuckets uint
+	lock       sync.RWMutex
 }
 
 /*
@@ -45,6 +56,7 @@ func NewDlcbf(numTables uint, numBuckets uint) (*Dlcbf, error) {
 		numTables:  numTables,
 		numBuckets: numBuckets,
 		tables:     make([]table, numTables, numTables),
+		lock:       sync.RWMutex{},
 	}
 
 	for i := range dlcbf.tables {
@@ -58,11 +70,11 @@ func NewDlcbf(numTables uint, numBuckets uint) (*Dlcbf, error) {
 NewDlcbfForCapacity returns a newly created Dlcbf for a given max Capacity
 */
 func NewDlcbfForCapacity(capacity uint) (*Dlcbf, error) {
-	t := capacity / (4096 * bucketHeight)
-	return NewDlcbf(t, 4096)
+	t := capacity / (bucketsSize * bucketHeight)
+	return NewDlcbf(t, bucketsSize)
 }
 
-func (dlcbf *Dlcbf) getTargets(data []byte) []target {
+func (dlcbf *Dlcbf) getTarget(data []byte) target {
 	hasher := fnv.New64a()
 	hasher.Write(data)
 	fp := hasher.Sum(nil)
@@ -77,12 +89,16 @@ func (dlcbf *Dlcbf) getTargets(data []byte) []target {
 		indices[i] = (saltedHash % dlcbf.numBuckets)
 	}
 
-	targets := make([]target, dlcbf.numTables, dlcbf.numTables)
-	for i := uint(0); i < dlcbf.numTables; i++ {
-		targets[i] = target{
-			bucketIndex: uint(indices[i]),
-			fingerprint: fingerprint(binary.LittleEndian.Uint16(fp)),
-		}
+	return target{
+		bucketIndex: indices,
+		fingerprint: fingerprint(binary.LittleEndian.Uint16(fp)),
+	}
+}
+
+func (dlcbf *Dlcbf) getTargets(datas [][]byte) []target {
+	targets := make([]target, len(datas))
+	for k := range datas {
+		targets[k] = dlcbf.getTarget(datas[k])
 	}
 	return targets
 }
@@ -91,58 +107,86 @@ func (dlcbf *Dlcbf) getTargets(data []byte) []target {
 Add data to filter return true if insertion was successful,
 returns false if data already in filter or size limit was exceeeded
 */
-func (dlcbf *Dlcbf) Add(data []byte) bool {
-	targets := dlcbf.getTargets(data)
-
-	_, _, target := dlcbf.lookup(targets)
-	if target != nil {
-		return false
+func (dlcbf *Dlcbf) addTarget(t target) bool {
+	m := dlcbf.lookup(t)
+	if m != nil {
+		// key already exist
+		bucket := &dlcbf.tables[m.tbl][m.bkt]
+		if bucket.counters[m.entry] >= math.MaxUint8 {
+			// the counter exceed the limit
+			return false
+		}
+		bucket.counters[m.entry]++
+		return true
 	}
 
 	minCount := uint8(math.MaxUint8)
 	tableI := uint(0)
 
-	for i, target := range targets {
-		tmpCount := dlcbf.tables[i][target.bucketIndex].count
+	for i, idx := range t.bucketIndex {
+		tmpCount := dlcbf.tables[i][idx].count
 		if tmpCount < minCount && tmpCount < bucketHeight {
-			minCount = dlcbf.tables[i][target.bucketIndex].count
+			minCount = dlcbf.tables[i][idx].count
 			tableI = uint(i)
 		}
 	}
 
 	if minCount == uint8(math.MaxUint8) {
+		// insert failed
 		return false
 	}
-	bucket := &dlcbf.tables[tableI][targets[tableI].bucketIndex]
-	bucket.entries[minCount] = targets[tableI].fingerprint
+	bucket := &dlcbf.tables[tableI][t.bucketIndex[tableI]]
+	bucket.entries[minCount] = t.fingerprint
+	bucket.counters[minCount] = 1
 	bucket.count++
 	return true
+}
+
+func (dlcbf *Dlcbf) Add(data []byte) bool {
+	t := dlcbf.getTarget(data)
+
+	dlcbf.lock.Lock()
+	defer dlcbf.lock.Unlock()
+
+	return dlcbf.addTarget(t)
+}
+
+func (dlcbf *Dlcbf) AddBatch(datas [][]byte) []bool {
+	targets := dlcbf.getTargets(datas)
+	res := make([]bool, len(datas))
+
+	dlcbf.lock.Lock()
+	defer dlcbf.lock.Unlock()
+
+	for k := range targets {
+		res[k] = dlcbf.addTarget(targets[k])
+	}
+	return res
 }
 
 /*
 Delete data to filter return true if deletion was successful,
 returns false if data not in filter
 */
-func (dlcbf *Dlcbf) Delete(data []byte) bool {
+func (dlcbf *Dlcbf) deleteTarget(t target) bool {
 	deleted := false
-	targets := dlcbf.getTargets(data)
-	for i, target := range targets {
-		for j, fp := range dlcbf.tables[i][target.bucketIndex].entries {
-			if fp == target.fingerprint {
-				if dlcbf.tables[i][target.bucketIndex].count == 0 {
+	for i, idx := range t.bucketIndex {
+		for j, fp := range dlcbf.tables[i][idx].entries {
+			if fp == t.fingerprint {
+				if dlcbf.tables[i][idx].count == 0 {
 					continue
 				}
-				dlcbf.tables[i][target.bucketIndex].count--
-				k := 0
-				for l, fp := range dlcbf.tables[i][target.bucketIndex].entries {
-					if j == l {
-						continue
-					}
-					dlcbf.tables[i][target.bucketIndex].entries[k] = fp
-					k++
+				// move entries after entry to be deleted
+				var k uint8
+				for k = uint8(j + 1); k < dlcbf.tables[i][idx].count; k++ {
+					dlcbf.tables[i][idx].entries[k-1] = dlcbf.tables[i][idx].entries[k]
+					dlcbf.tables[i][idx].counters[k-1] = dlcbf.tables[i][idx].counters[k]
 				}
-				lastindex := dlcbf.tables[i][target.bucketIndex].count
-				dlcbf.tables[i][target.bucketIndex].entries[lastindex] = 0
+
+				dlcbf.tables[i][idx].count--
+				lastindex := dlcbf.tables[i][idx].count
+				dlcbf.tables[i][idx].entries[lastindex] = 0
+				dlcbf.tables[i][idx].counters[lastindex] = 0
 				deleted = true
 			}
 		}
@@ -150,30 +194,86 @@ func (dlcbf *Dlcbf) Delete(data []byte) bool {
 	return deleted
 }
 
-func (dlcbf *Dlcbf) lookup(targets []target) (uint, uint, *target) {
-	for i, target := range targets {
-		for j, fp := range dlcbf.tables[i][target.bucketIndex].entries {
-			if fp == target.fingerprint {
-				return uint(i), uint(j), &target
+func (dlcbf *Dlcbf) Delete(data []byte) bool {
+	t := dlcbf.getTarget(data)
+
+	dlcbf.lock.Lock()
+	defer dlcbf.lock.Unlock()
+
+	return dlcbf.deleteTarget(t)
+}
+
+func (dlcbf *Dlcbf) DeleteBatch(datas [][]byte) []bool {
+	targets := dlcbf.getTargets(datas)
+	res := make([]bool, len(datas))
+
+	dlcbf.lock.Lock()
+	defer dlcbf.lock.Unlock()
+
+	for k := range targets {
+		res[k] = dlcbf.deleteTarget(targets[k])
+	}
+	return res
+}
+
+func (dlcbf *Dlcbf) lookup(t target) *match {
+	for i, idx := range t.bucketIndex {
+		for j, fp := range dlcbf.tables[i][idx].entries {
+			if fp == t.fingerprint {
+				return &match{
+					tbl:         uint(i),
+					bkt:         idx,
+					entry:       uint(j),
+					fingerprint: fp,
+				}
 			}
 		}
 	}
-	return 0, 0, nil
+	return nil
 }
 
 /*
-IsMember returns true if data is in filter
+Get returns counter if data is in filter
 */
-func (dlcbf *Dlcbf) IsMember(data []byte) bool {
-	targets := dlcbf.getTargets(data)
-	_, _, bfp := dlcbf.lookup(targets)
-	return bfp != nil
+func (dlcbf *Dlcbf) targetCounter(t target) uint8 {
+	dlcbf.lock.RLock()
+	defer dlcbf.lock.RUnlock()
+
+	m := dlcbf.lookup(t)
+	if m == nil {
+		return 0
+	}
+	return dlcbf.tables[m.tbl][m.bkt].counters[m.entry]
+}
+
+func (dlcbf *Dlcbf) targetsCounter(targets []target) []uint8 {
+	dlcbf.lock.RLock()
+	defer dlcbf.lock.RUnlock()
+
+	res := make([]uint8, len(targets))
+	for k := range targets {
+		m := dlcbf.lookup(targets[k])
+		if m == nil {
+			res[k] = 0
+		} else {
+			res[k] = dlcbf.tables[m.tbl][m.bkt].counters[m.entry]
+		}
+	}
+	return res
+}
+
+func (dlcbf *Dlcbf) Get(data []byte) uint8 {
+	return dlcbf.targetCounter(dlcbf.getTarget(data))
+}
+
+func (dlcbf *Dlcbf) GetBatch(datas [][]byte) []uint8 {
+	return dlcbf.targetsCounter(dlcbf.getTargets(datas))
 }
 
 /*
 GetCount returns cardinlaity count of current filter
 */
-func (dlcbf *Dlcbf) GetCount() uint {
+func (dlcbf *Dlcbf) Count() uint {
 	count := uint(0)
 	for _, table := range dlcbf.tables {
 		for _, bucket := range table {

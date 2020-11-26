@@ -21,7 +21,7 @@ func TestDlcbf(t *testing.T) {
 		dlcbf.Add(s)
 	}
 
-	count := dlcbf.GetCount()
+	count := dlcbf.Count()
 	if float64(count)*100/235886 < 1 {
 		t.Error("Expected error < 1 percent, got", float64(count)*100/235886)
 	}
@@ -38,7 +38,7 @@ func TestDlcbf(t *testing.T) {
 		dlcbf.Delete(s)
 	}
 
-	count = dlcbf.GetCount()
+	count = dlcbf.Count()
 	if count != 0 {
 		t.Error("Expected count == 0, got", count)
 	}
