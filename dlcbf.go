@@ -353,7 +353,7 @@ func (dlcbf *Dlcbf) Decode(bytes []byte) error {
 
 				if fp := binary.LittleEndian.Uint16(next[0:2]); fp != 0 {
 					dlcbf.tables[i][j].entries[k] = fingerprint(fp)
-					dlcbf.tables[i][j].counters[k] = bytes[2]
+					dlcbf.tables[i][j].counters[k] = next[2]
 					dlcbf.tables[i][j].count++
 				}
 			}
